@@ -18,7 +18,7 @@ Thumbs.db
 .idea/
 
 # Project Specific - Auto-Generated Logs
-runs/
+# runs/ (User requested to keep logs)
 
 # Large Model Files (Downloadable via setup)
 *.pt

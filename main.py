@@ -87,9 +87,14 @@ def main():
         # Calculate MS timestamp
         ts_ms = int((time.time() - start_time_s) * 1000)
 
-        # Track with ByteTrack for ID consistency
-        # classes=[0] enforces Person only filter
-        results = model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False, classes=[0])
+        # Track with ByteTrack
+        # Enable logging: save_txt=True, save_conf=True
+        results = model.track(frame, persist=True, tracker="bytetrack.yaml", 
+                            verbose=False, classes=[0],
+                            save=True,      # Save inference images/video
+                            save_txt=True,  # Save bounding box coordinates
+                            save_conf=True  # Save confidence scores
+                            )
         
         # --- LOGIC UPDATE ---
         targets = []
