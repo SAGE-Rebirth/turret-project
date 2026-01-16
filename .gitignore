@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+test-env/
+.env
+
+# System
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Project Specific - Auto-Generated Logs
+runs/
+
+# Large Model Files (Downloadable via setup)
+*.pt
+*.task
+face_landmarker.task
+yolo11n-pose.pt
+
+# MediaPipe / Ultralytics cache (if any)
+.ultralytics/
