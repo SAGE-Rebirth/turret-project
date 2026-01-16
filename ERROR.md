@@ -34,6 +34,40 @@
   curl -L -o face_landmarker.task https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
   ```
 
+## dlib Issues (Windows)
+
+### 1. `RuntimeError: CMake must be installed to build the following extensions: dlib`
+**Cause**: 
+`dlib` is a C++ library. On Windows, PyPI often does not provide pre-compiled binary "wheels" for your specific Python version. Therefore, `pip` tries to download the source code and **compile it locally** on your machine. This requires:
+1.  **CMake**: To generate the build files.
+2.  **C++ Compiler**: To actually compile the code (Visual Studio Build Tools).
+
+**Fix (Step-by-Step)**:
+
+**Step A: Install CMake**
+1.  Download the **Windows x64 Installer** from [cmake.org/download](https://cmake.org/download/).
+2.  Run the installer.
+3.  **CRITICAL**: Check the box **"Add CMake to the system PATH for all users"** during installation.
+4.  Restart your computer (or at least your terminal) to ensure the PATH is updated.
+5.  Verify by running `cmake --version` in your terminal.
+
+**Step B: Install Visual Studio Build Tools**
+If it still fails with "Visual Studio not found":
+1.  Download **Visual Studio Build Tools** from [visualstudio.microsoft.com/downloads](https://visualstudio.microsoft.com/downloads/).
+2.  Run the installer.
+3.  Select the **"Desktop development with C++"** workload.
+4.  Make sure **"MSVC ... C++ x64/x86 build tools"** is checked on the right side.
+5.  Install and wait for it to finish (it's large, ~2GB+).
+
+**Step C: Install dlib**
+Now try again:
+```bash
+pip install dlib
+```
+It should now compile successfully (this may take 5-10 minutes).
+
+---
+
 ## dlib Issues (macOS)
 
 ### 1. Installation Fails (CMake/Boost)

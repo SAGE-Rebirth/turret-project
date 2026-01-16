@@ -49,16 +49,22 @@ cd turret-project
 This keeps your project dependencies clean.
 ```bash
 python3 -m venv test-env
-source test-env/bin/activate  # On Windows use: test-env\Scripts\activate
+source test-env/bin/activate  
 ```
 
-### 3. Install Dependencies
+### 3. Windows Specific Prerequisites (Important!)
+Before installing dependencies, Windows users **must** install CMake to compile `dlib`.
+1.  **Download CMake**: [https://cmake.org/download/](https://cmake.org/download/)
+2.  **Install with PATH**: During installation, select **"Add CMake to the system PATH for all users"**.
+3.  **Restart**: Close and reopen your terminal/VS Code to refresh the PATH.
+
+### 4. Install Dependencies
 Install all required Python libraries (OpenCV, YOLO, MediaPipe, etc.):
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Download AI Models (Critical!)
+### 5. Download AI Models (Critical!)
 The system needs specific AI model files to work.
 - **YOLOv11 Pose**: Automatically downloaded on first run.
 - **Face Landmarker**: You **MUST** download this manually using the command below:
