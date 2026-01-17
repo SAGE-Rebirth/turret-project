@@ -8,7 +8,7 @@ env/
 venv/
 test-env/
 .env
-
+runs/pose/
 # System
 .DS_Store
 Thumbs.db
