@@ -150,6 +150,7 @@ class TargetManager:
             target_data = {
                 'id': pid,      # USE GLOBAL PID instead of transient ID
                 'yolo_id': yolo_id, # Keep track of transient ID for debug
+                'conf': float(box.conf[0]), # Confidence Score
                 'box': (x1, y1, x2, y2),
                 'center': ((x1+x2)//2, (y1+y2)//2), # Box Center
                 'keypoints': kps, # Store raw keypoints for advanced vis

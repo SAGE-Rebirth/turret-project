@@ -98,18 +98,22 @@ def draw_hud(frame, turret, targets, primary, aim_mode_idx, manager):
         if is_safe:
             color = (0, 165, 255) # Orange for Safe Zone
             thick = 2
-            label = f"ID:{t['id']} [SAFE]"
+            # Add Confidence
+            conf = t.get('conf', 0.0)
+            label = f"ID:{t['id']} [SAFE] {conf:.2f}"
             cv2.putText(frame, "SAFE", (x1, y1-25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         elif t['locked'] and t == primary:
             color = (0, 0, 255) # Red for Engaged
             thick = 3
-            label = f"ID:{t['id']} [ENGAGED]"
+            conf = t.get('conf', 0.0)
+            label = f"ID:{t['id']} [ENGAGED] {conf:.2f}"
             # Line to Aim Point
             cv2.line(frame, (cx, cy), t['aim_point'], color, 2)
         else:
             color = (0, 255, 255) # Yellow for Others
             thick = 1
-            label = f"ID:{t['id']}"
+            conf = t.get('conf', 0.0)
+            label = f"ID:{t['id']} {conf:.2f}"
             
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thick)
         cv2.putText(frame, label, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)

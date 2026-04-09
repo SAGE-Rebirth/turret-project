@@ -118,13 +118,16 @@ class IdentityManager:
                     }
                     print(f"[IDENTITY] New Persistent ID: {found_pid} (No match found)")
                 else:
-                    self.known_entities[found_pid]['last_seen'] = time.time()
-                    print(f"[IDENTITY] Matched {found_pid} (Dist: {dist:.3f})")
+                    # Found existing match (Trusted or Known)
+                    if found_pid in self.known_entities:
+                        self.known_entities[found_pid]['last_seen'] = time.time()
+                        
+                        # Add to gallery if match is good but not identical (Learning)
+                        # Limit gallery size to 5
+                        if len(self.known_entities[found_pid]['encodings']) < 5:
+                            self.known_entities[found_pid]['encodings'].append(current_encoding)
                     
-                    # Add to gallery if match is good but not identical (Learning)
-                    # Limit gallery size to 5
-                    if len(self.known_entities[found_pid]['encodings']) < 5:
-                        self.known_entities[found_pid]['encodings'].append(current_encoding)
+                    print(f"[IDENTITY] Matched {found_pid} (Dist: {dist:.3f})")
                 
                 # Update Mapping
                 self.yolo_to_pid[yolo_id] = found_pid
