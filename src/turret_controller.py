@@ -1,6 +1,12 @@
 import numpy as np
 from .config import TURRET_LIMITS, PIXELS_PER_DEGREE
 
+# Bound the integral term so a long lock-loss can't wind it into a multi-second
+# overshoot. With ki=0.01 and a clamp of 500, the integral contributes at most
+# 5° of "PID unit" before output clipping, well within MAX_*_SPEED.
+INTEGRAL_CLAMP = 500.0
+
+
 class TurretController:
     """
     Simulates a 2-axis gimbal/turret with PID control.
@@ -9,13 +15,19 @@ class TurretController:
     def __init__(self, kp=0.1, ki=0.01, kd=0.05):
         self.pan_angle = 0.0
         self.tilt_angle = 0.0
-        
-        # PID constants
+
         self.kp = kp
         self.ki = ki
         self.kd = kd
-        
-        # State
+
+        self.prev_error_x = 0
+        self.prev_error_y = 0
+        self.integral_x = 0
+        self.integral_y = 0
+
+    def reset_state(self):
+        """Zero PID memory. Call on target switch / lock loss to prevent
+        the integral and derivative terms from referencing the prior target."""
         self.prev_error_x = 0
         self.prev_error_y = 0
         self.integral_x = 0
@@ -27,13 +39,13 @@ class TurretController:
         error_x, error_y: Pixel difference from center.
         """
         # --- PID: X-axis (Pan) ---
-        self.integral_x += error_x
+        self.integral_x = float(np.clip(self.integral_x + error_x, -INTEGRAL_CLAMP, INTEGRAL_CLAMP))
         derivative_x = error_x - self.prev_error_x
         output_x = (self.kp * error_x) + (self.ki * self.integral_x) + (self.kd * derivative_x)
         self.prev_error_x = error_x
-        
+
         # --- PID: Y-axis (Tilt) ---
-        self.integral_y += error_y
+        self.integral_y = float(np.clip(self.integral_y + error_y, -INTEGRAL_CLAMP, INTEGRAL_CLAMP))
         derivative_y = error_y - self.prev_error_y
         output_y = (self.kp * error_y) + (self.ki * self.integral_y) + (self.kd * derivative_y)
         self.prev_error_y = error_y

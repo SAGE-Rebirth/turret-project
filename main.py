@@ -1,3 +1,4 @@
+import os
 import cv2
 import numpy as np
 import time
@@ -11,7 +12,7 @@ except ImportError:
 
 from src.turret_controller import TurretController
 from src.target_manager import TargetManager
-from src.visualization import draw_hud, draw_registration_ui
+from src.visualization import draw_hud, draw_registration_ui, draw_skeleton, draw_mediapipe_mesh
 
 def main():
     print("[SYSTEM] Initializing Safe Turret System...")
@@ -87,10 +88,16 @@ def main():
     
     # Multi-Sample State
     accumulated_encodings = []
+    pending_encoding_futures = []
     last_sample_time = 0
+    registration_done = False  # latched True after a successful register
+                               # within one R-hold; reset on release
     
     # Snapshot State
     session_snapshots = set()
+    snapshot_dir = os.path.join("runs", "pose", f"track_{int(time.time())}")
+    os.makedirs(snapshot_dir, exist_ok=True)
+    snapshot_counter = [0]  # mutable so the inner block can increment
 
     try:
         while True:
@@ -99,44 +106,55 @@ def main():
                 print("[ERROR] Camera frame dropped.")
                 break
             
-            # --- FRAME SAFETY ---
-            # Create a clean copy for AI/Threads to use. 
-            # This prevents race conditions where 'frame' is modified by drawing whilst AI reads it.
-            clean_frame = frame.copy()
-            
-            # Calculate MS timestamp
+            # Frame ownership: YOLO + IdentityManager run BEFORE any HUD
+            # drawing, so they can read `frame` directly. IdentityManager
+            # crops + copies internally before handing data to its thread.
             ts_ms = int((time.time() - start_time_s) * 1000)
-    
-            # Track with ByteTrack (Use CLEAN frame)
-            # Enable logging: save_txt=True, save_conf=True
+
             try:
-                results = model.track(clean_frame, persist=True, tracker="bytetrack.yaml", 
-                                    verbose=False, classes=[0],
-                                    save=True,      # Save inference images/video
-                                    save_txt=True,  # Save bounding box coordinates
-                                    save_conf=True  # Save confidence scores
-                                    )
+                results = model.track(frame, persist=True, tracker="bytetrack.yaml",
+                                    verbose=False, classes=[0])
             except Exception as e:
                 print(f"[ERROR] YOLO Track Failed: {e}")
                 results = None
-            
-            # --- LOGIC UPDATE ---
+
             targets = []
             primary = None
-            
+
             if results:
-                run_dir = results[0].save_dir # Get YOLO's active run folder
-                
-                # Pass the CLEAN results and CLEAN frame for identity
-                targets = manager.select_targets(results[0], clean_frame, aim_mode)
+                targets = manager.select_targets(results[0], frame, aim_mode)
                 primary = manager.primary_target
+
+            # Snapshot crops BEFORE any HUD drawing so AI consumers
+            # (registration encoding, MediaPipe mesh) see a clean image.
+            # primary_crop targets the TOP 40% of the bbox so face_recognition's
+            # HOG detector gets a face-centric crop instead of a small face
+            # inside a tall body crop — improves encoding quality during
+            # registration and identity scans.
+            primary_crop = None
+            if primary is not None:
+                px1, py1, px2, py2 = primary['box']
+                px1, py1 = max(0, px1), max(0, py1)
+                px2, py2 = min(W, px2), min(H, py2)
+                if px2 > px1 and py2 > py1:
+                    bh = py2 - py1
+                    face_y2 = py1 + max(int(bh * 0.4), 60)
+                    face_y2 = min(face_y2, py2)
+                    primary_crop = frame[py1:face_y2, px1:px2].copy()
+
+            mp_rgb = None
+            if primary is not None:
+                mp_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 
             # --- TURRET PID UPDATE ---
+            # Reset PID memory whenever the locked track changes (or we
+            # lose the lock) so the integral/derivative don't reference a
+            # prior target's error history.
+            if manager.target_lost:
+                turret.reset_state()
+
             if primary:
-                # Use the calculated AIM POINT
                 target_x, target_y = primary['aim_point']
-                
-                # Error = Target Point - Frame Center
                 error_x = target_x - (W // 2)
                 error_y = target_y - (H // 2)
                 turret.update(error_x, error_y)
@@ -154,143 +172,143 @@ def main():
             elif key == ord('m'):
                 manager.manual_mode = not manager.manual_mode
                 print(f"[SYSTEM] Manual Mode: {manager.manual_mode}")
-                # If switching to Manual, lock onto current primary (if any)
                 if manager.manual_mode and manager.primary_target:
-                    manager.selected_id = manager.primary_target['id']
+                    manager.selected_yolo_id = manager.primary_target['yolo_id']
                 elif not manager.manual_mode:
-                    manager.selected_id = None
-            elif key == 9: # TAB Key (ASCII 9)
+                    manager.selected_yolo_id = None
+            elif key == 9:  # TAB
                 if manager.manual_mode and len(targets) > 0:
-                    # Cycle ID
-                    # Get list of IDs
-                    ids = sorted([t['id'] for t in targets])
-                    
-                    if manager.selected_id in ids:
-                        idx = ids.index(manager.selected_id)
-                        next_idx = (idx + 1) % len(ids)
-                        manager.selected_id = ids[next_idx]
+                    yolo_ids = sorted(t['yolo_id'] for t in targets)
+                    if manager.selected_yolo_id in yolo_ids:
+                        idx = yolo_ids.index(manager.selected_yolo_id)
+                        manager.selected_yolo_id = yolo_ids[(idx + 1) % len(yolo_ids)]
                     else:
-                        # If current selected is lost, pick first
-                        manager.selected_id = ids[0]
-                    
-                    print(f"[SYSTEM] Switched Target -> {manager.selected_id} (Available: {ids})")
+                        manager.selected_yolo_id = yolo_ids[0]
+                    print(f"[SYSTEM] Switched Target -> yolo_id={manager.selected_yolo_id} "
+                          f"(Available: {yolo_ids})")
     
             # --- REGISTRATION LOGIC (Robust & Multi-Sample) ---
-            # Update State based on Key
             if key == ord('r'):
                 last_r_time = time.time()
                 if reg_start_time is None:
                     reg_start_time = time.time()
-                    accumulated_encodings = [] # Reset buffer
-            
-            # Check if we are in "Active" state (Grace period 0.5s)
-            is_registering = (time.time() - last_r_time < 0.5)
-            
+                    accumulated_encodings = []
+                    pending_encoding_futures = []
+
+            # Stay in registering state if futures are still pending so a
+            # late-arriving encoding can still complete registration even
+            # after the user releases R.
+            is_registering = (time.time() - last_r_time < 0.5
+                              or (reg_start_time is not None
+                                  and pending_encoding_futures))
+
             if is_registering and reg_start_time is not None:
-                 duration = time.time() - reg_start_time
-                 progress = min(1.0, duration / 2.0)
-                 
-                 # Draw UI Overlay
-                 draw_registration_ui(frame, progress)
-                 
-                 # --- ALGORITHMIC SCANNING (Multi-Sample) ---
-                 # Every 0.1s, try to capture a sample
-                 if primary and progress < 1.0:
-                     if time.time() - last_sample_time > 0.1:
-                         # Sample Face
-                         x1, y1, x2, y2 = primary['box']
-                         x1, y1 = max(0, x1), max(0, y1)
-                         x2, y2 = min(W, x2), min(H, y2)
-                         
-                         # Use CLEAN frame for data
-                         # Make a copy of the frame before drawing on it for clean crop
-                         # Note: clean_frame is already clean
-                         crop = clean_frame[y1:y2, x1:x2]
-                         if crop.size > 0:
-                             import face_recognition
-                             rgb_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                             encs = face_recognition.face_encodings(rgb_crop)
-                             if len(encs) > 0:
-                                 accumulated_encodings.append(encs[0])
-                                 # feedback (optional print)
-                                 # print(f".", end="", flush=True) 
-                             
-                         last_sample_time = time.time()
-    
-                 # Trigger Complete
-                 if progress >= 1.0:
-                     if len(accumulated_encodings) > 3: # Require at least 3 good samples
-                         # COMPUTE AVERAGE ENCODING (Centroid)
-                         mean_encoding = np.mean(accumulated_encodings, axis=0)
-                         
-                         # Register
-                         manager.id_manager.register_trusted_identity("COMMANDER", [mean_encoding])
-                         print(f"[SYSTEM] Registered COMMANDER with {len(accumulated_encodings)} samples.")
-                         # Hold the "Complete" state for a moment before resetting?
-                         # For now, we rely on the loop continuing as long as R is held.
-                     else:
-                         # Failed to get enough samples
-                         cv2.putText(frame, "KEEP FACE STEADY", (W//2 - 100, H//2 + 50), 
+                duration = time.time() - reg_start_time
+                progress = min(1.0, duration / 2.0)
+                draw_registration_ui(frame, progress)
+
+                # Drain finished encoding futures (non-blocking).
+                still_pending = []
+                for fut in pending_encoding_futures:
+                    if fut.done():
+                        enc = fut.result()
+                        if enc is not None:
+                            accumulated_encodings.append(enc)
+                    else:
+                        still_pending.append(fut)
+                pending_encoding_futures = still_pending
+
+                # Submit a new sample every 0.1s — encoding runs on the
+                # IdentityManager's executor, never blocks the display.
+                if primary and primary_crop is not None and progress < 1.0 \
+                        and time.time() - last_sample_time > 0.1:
+                    pending_encoding_futures.append(
+                        manager.id_manager.encode_async(primary_crop)
+                    )
+                    last_sample_time = time.time()
+
+                if progress >= 1.0:
+                    # Wait briefly for any in-flight encodings to land before
+                    # deciding success/failure. Encoding takes ~50-100ms each
+                    # and the executor is single-worker, so a 2s window can
+                    # leave several futures still pending at progress==1.0.
+                    if pending_encoding_futures:
+                        cv2.putText(frame, "FINALIZING…",
+                                    (W // 2 - 80, H // 2 + 50),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+                    elif registration_done:
+                        # Already registered this hold — show success until
+                        # the user releases R.
+                        cv2.putText(frame, "REGISTERED",
+                                    (W // 2 - 90, H // 2 + 50),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    elif len(accumulated_encodings) >= 3:
+                        mean_encoding = np.mean(accumulated_encodings, axis=0)
+                        manager.id_manager.register_trusted_identity(
+                            "COMMANDER", [mean_encoding]
+                        )
+                        print(f"[SYSTEM] Registered COMMANDER with "
+                              f"{len(accumulated_encodings)} samples.")
+                        registration_done = True
+                    else:
+                        cv2.putText(frame, "KEEP FACE STEADY",
+                                    (W // 2 - 100, H // 2 + 50),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
             else:
-                # Reset
                 reg_start_time = None
                 accumulated_encodings = []
+                pending_encoding_futures = []
+                registration_done = False
     
             # --- RENDER LAYERS ---
             draw_hud(frame, turret, targets, primary, aim_mode, manager)
+
+            # Manual-mode lock-lost banner: user TAB'd onto a track that
+            # is no longer visible (occluded, off-screen, ID-switched).
+            if manager.manual_mode and manager.selected_yolo_id is not None and primary is None:
+                cv2.putText(frame, "TARGET LOST — TAB to reacquire",
+                            (W // 2 - 260, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
     
             # --- TECH DEMO VISUALS ---
-            from src.visualization import draw_skeleton, draw_mediapipe_mesh
-            
             # 1. Pose Skeleton (For ALL tracked persons)
             if results and results[0].keypoints is not None:
                  for i, kps in enumerate(results[0].keypoints):
-                     # Get raw xy
                      kp_xy = kps.xy[0].cpu().numpy()
                      draw_skeleton(frame, kp_xy)
-    
-            # 2. MediaPipe Face Landmarker (Tasks API)
-            # Process for ALL faces (not just primary)
-            rgb_frame = cv2.cvtColor(clean_frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-             
-            # Process Async (Video Mode)
-            detection_result = landmarker.detect_for_video(mp_image, ts_ms)
-             
-            if detection_result.face_landmarks:
-                 draw_mediapipe_mesh(frame, detection_result.face_landmarks)
-    
+
+            # 2. MediaPipe Face Landmarker (Tasks API) — only when locked.
+            # mp_rgb was captured BEFORE any HUD drawing so labels/boxes
+            # don't bleed into the mesh.
+            if mp_rgb is not None:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=mp_rgb)
+                detection_result = landmarker.detect_for_video(mp_image, ts_ms)
+                if detection_result.face_landmarks:
+                    draw_mediapipe_mesh(frame, detection_result.face_landmarks)
+
             # --- 4. AUTO-SNAPSHOT (After Rendering) ---
-            # User requirement: "Save full frame with labels when new person enters"
-            # We need to detect if a NEW person entered this frame.
-            new_ids_this_frame = []
-            if results:
-                 run_dir = results[0].save_dir
-                 if run_dir:
-                     import os
-                     for t in targets:
-                         tid = t['id']
-                         
-                         # LOGIC CHANGE: Track ALL IDs, even temporary "Trk-" ones.
-                         # If a new track appears (Trk-12), we snapshot it.
-                         # If it later becomes "ID-05", we might snapshot again (which is fine/good).
-                         # CONFIDENCE FILTER: Only snapshot if > 60% confidence to avoid "Random" ghosts
-                         conf = t.get('conf', 0.0)
-                         if tid not in session_snapshots and conf > 0.6:
-                             new_ids_this_frame.append(tid)
-                             session_snapshots.add(tid)
-                     
-                     if new_ids_this_frame:
-                         count = len([name for name in os.listdir(run_dir) if name.startswith("image") and name.endswith(".jpg")])
-                         filename = f"image{count}.jpg"
-                         path = os.path.join(run_dir, filename)
-                         
-                         # Ensure directory exists (YOLO should create it, but safe check)
-                         if not os.path.exists(run_dir): os.makedirs(run_dir)
-                         
-                         cv2.imwrite(path, frame)
-                         print(f"[SYSTEM] Snapshot Saved: {path} (Trigger: {new_ids_this_frame})")
+            # Only snapshot stable PIDs (ID-NN or trusted names like COMMANDER).
+            # Transient "Trk-N" / "Scanning..." would otherwise cause double
+            # snapshots once identity resolves.
+            if results and snapshot_dir:
+                new_ids_this_frame = []
+                for t in targets:
+                    tid = t['id']
+                    if not isinstance(tid, str):
+                        continue
+                    if tid.startswith("Trk-") or tid.startswith("Scanning"):
+                        continue
+                    conf = t.get('conf', 0.0)
+                    if tid not in session_snapshots and conf > 0.6:
+                        new_ids_this_frame.append(tid)
+                        session_snapshots.add(tid)
+
+                if new_ids_this_frame:
+                    filename = f"image{snapshot_counter[0]}.jpg"
+                    snapshot_counter[0] += 1
+                    path = os.path.join(snapshot_dir, filename)
+                    cv2.imwrite(path, frame)
+                    print(f"[SYSTEM] Snapshot Saved: {path} (Trigger: {new_ids_this_frame})")
     
             # --- DISPLAY ---
             cv2.imshow("Safe Turret Sim", frame)

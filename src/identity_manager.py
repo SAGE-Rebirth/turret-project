@@ -9,8 +9,13 @@ class IdentityManager:
     Manages persistent identities using facial recognition with Asynchronous Processing.
     Ensures the main thread is NEVER blocked by face_recognition.
     """
-    def __init__(self, match_tolerance=0.65):
+    def __init__(self, match_tolerance=0.6, trusted_tolerance=0.5):
+        # General-gallery threshold: face_recognition's standard is 0.6;
+        # we use it for the auto-discovered ID-NN gallery.
         self.match_tolerance = match_tolerance
+        # Trusted/VIP threshold is stricter — a false COMMANDER match has
+        # higher consequence than a false ID-NN match.
+        self.trusted_tolerance = trusted_tolerance
         
         # Database: { 'PID-1': {'encodings': [np.array(...)], 'last_seen': ts} }
         self.known_entities = {}
@@ -26,21 +31,65 @@ class IdentityManager:
         # Check Limiter: { yolo_id: last_check_time }
         self.last_check_time = {}
         self.check_interval = 1.0 # Check every 1s per ID
-        
+        # Once a yolo_id has matched a stable PID this many times, stop re-checking.
+        self.confirm_threshold = 3
+        self.confirm_counts = {} # { yolo_id: int }
+        self.confirmed_ids = set() # yolo_ids whose PID is locked in
+
         # Async Executor
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.pending_tasks = set() # Track YOLO IDs currently being processed
+        # Hard cap on inflight identity work. With max_workers=1 the queue is
+        # effectively the pending_tasks set; cap it to avoid backpressure when
+        # many tracks appear at once.
+        self.max_inflight = 4
         
         print(f"[SYSTEM] AsyncIdentityManager Initialized (Tol={self.match_tolerance})")
         print("[SYSTEM] Deep Metric Learning Model: ResNet-34 (dlib) Active")
 
+    def encode_async(self, bgr_crop):
+        """Submit a face crop for encoding. Returns a Future yielding the
+        first encoding (np.ndarray) or None if no face was found.
+
+        Off-loads face_recognition.face_encodings from the main thread so the
+        registration loop doesn't block the display."""
+        return self.executor.submit(self._encode_crop_bg, bgr_crop)
+
+    def _encode_crop_bg(self, bgr_crop):
+        try:
+            h, w = bgr_crop.shape[:2]
+            if w > 200:
+                scale = 200 / w
+                bgr_crop = cv2.resize(bgr_crop, (0, 0), fx=scale, fy=scale)
+            rgb = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2RGB)
+            encs = face_recognition.face_encodings(rgb)
+            return encs[0] if len(encs) > 0 else None
+        except Exception as e:
+            print(f"[ERROR] encode_async: {e}")
+            return None
+
     def register_trusted_identity(self, name, encodings):
         """
         Explicitly register a VIP/Trusted Identity.
-        encodings: List of face encodings.
+        encodings: List of face encodings (typically a single centroid).
+
+        Appends to existing samples for this name rather than replacing,
+        so re-running registration augments the gallery instead of
+        clobbering it. Cap at 10 to bound match cost.
         """
-        self.trusted_identities[name] = encodings
-        print(f"[IDENTITY] Registered Trusted Identity: {name} ({len(encodings)} samples)")
+        existing = self.trusted_identities.get(name, [])
+        existing.extend(encodings)
+        self.trusted_identities[name] = existing[-10:]
+
+        # Invalidate confirmation cache: tracks that were "confirmed" as
+        # ID-NN before this registration must get another chance to match
+        # the trusted identity, otherwise they stay frozen on the old PID.
+        self.confirmed_ids.clear()
+        self.confirm_counts.clear()
+        self.last_check_time.clear()
+
+        print(f"[IDENTITY] Registered Trusted Identity: {name} "
+              f"({len(self.trusted_identities[name])} total samples)")
 
     def get_pid(self, frame, box, yolo_id):
         """
@@ -52,7 +101,10 @@ class IdentityManager:
         """
         # 1. Return cached result if available
         if yolo_id in self.yolo_to_pid:
-            # Check if we need to re-verify (re-scan)
+            # Confirmed PIDs never re-scan — saves a face_recognition call
+            # per active track per second for the rest of the session.
+            if yolo_id in self.confirmed_ids:
+                return self.yolo_to_pid[yolo_id]
             last_time = self.last_check_time.get(yolo_id, 0)
             if time.time() - last_time < self.check_interval:
                 return self.yolo_to_pid[yolo_id]
@@ -73,9 +125,20 @@ class IdentityManager:
         # Skip invalid boxes
         if (x2 - x1) < 20 or (y2 - y1) < 20:
              return self.yolo_to_pid.get(yolo_id, f"Trk-{yolo_id}")
-             
-        crop = frame[y1:y2, x1:x2].copy() # COPY is crucial for threads
-        
+
+        # Drop new identity work when the executor is saturated. The track
+        # will be re-checked on a later frame.
+        if len(self.pending_tasks) >= self.max_inflight:
+             return self.yolo_to_pid.get(yolo_id, f"Trk-{yolo_id}")
+
+        # Crop the FACE region (top ~40% of bbox) instead of the full body
+        # so the encoding compares cleanly to registration samples (which
+        # also use the face region). face_recognition's HOG detector
+        # struggles when the face is a small fraction of the crop.
+        bh = y2 - y1
+        face_y2 = min(y2, y1 + max(int(bh * 0.4), 60))
+        crop = frame[y1:face_y2, x1:x2].copy()  # COPY is crucial for threads
+
         self.pending_tasks.add(yolo_id)
         self.executor.submit(self._process_face_bg, crop, yolo_id)
         
@@ -126,11 +189,20 @@ class IdentityManager:
                         # Limit gallery size to 5
                         if len(self.known_entities[found_pid]['encodings']) < 5:
                             self.known_entities[found_pid]['encodings'].append(current_encoding)
-                    
+
                     print(f"[IDENTITY] Matched {found_pid} (Dist: {dist:.3f})")
-                
+
                 # Update Mapping
+                prior = self.yolo_to_pid.get(yolo_id)
                 self.yolo_to_pid[yolo_id] = found_pid
+
+                # Promote to "confirmed" after N consecutive matches to the same PID.
+                if prior == found_pid:
+                    self.confirm_counts[yolo_id] = self.confirm_counts.get(yolo_id, 1) + 1
+                    if self.confirm_counts[yolo_id] >= self.confirm_threshold:
+                        self.confirmed_ids.add(yolo_id)
+                else:
+                    self.confirm_counts[yolo_id] = 1
 
         except Exception as e:
             print(f"[ERROR] bg_process: {e}")
@@ -147,13 +219,13 @@ class IdentityManager:
         best_dist = 1.0
         found_pid = None
         
-        # 1. Check Trusted/VIP Identities FIRST
-        # Slightly stricter/same tolerance? Let's use same for now.
+        # 1. Check Trusted/VIP Identities FIRST with stricter threshold —
+        # a false COMMANDER match is more costly than a false ID-NN.
         for name, encodings in self.trusted_identities.items():
             distances = face_recognition.face_distance(encodings, encoding)
             min_dist = min(distances) if len(distances) > 0 else 1.0
-            
-            if min_dist < self.match_tolerance and min_dist < best_dist:
+
+            if min_dist < self.trusted_tolerance and min_dist < best_dist:
                 best_dist = min_dist
                 found_pid = name # e.g. "COMMANDER"
 
